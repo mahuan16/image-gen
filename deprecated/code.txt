@@ -1,0 +1,365 @@
+import os
+import sys
+import logging
+from typing import Any, Optional
+
+import requests
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stderr,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+mcp = FastMCP(
+    "runninghub-image-tools",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
+)
+
+API_KEY = "xxxxxx"
+UPLOAD_URL = "https://www.runninghub.ai/task/openapi/upload"
+RUN_URL = "https://www.runninghub.ai/openapi/v2/run/ai-app/2034097696507699202"
+QUERY_URL = "https://www.runninghub.ai/openapi/v2/query"
+
+DEFAULT_GIRL = "dfc5de59696c5e128676990f31df84bf2e6224c067dce37a0e307e62ce4ac156.png"
+DEFAULT_OUTFIT = "5c2ecb6f90e7e190df612def546161b0469bd76e1edba79092abefe07bb418f4.jpg"
+DEFAULT_PROMPT = "put her in an elegant outfit and pose"
+
+outfitImage = DEFAULT_OUTFIT
+girlImage = DEFAULT_GIRL
+prompt = DEFAULT_PROMPT
+
+current_task_id = None
+
+# helper functions
+def require_api_key() -> str:
+    if not API_KEY:
+        raise RuntimeError("RUNNINGHUB_API_KEY is not set")
+    return API_KEY
+
+
+# uploads a file to runninghub
+def upload_file(path: str, mime: str, api_key: str) -> str:
+    """Helper: POST a local file to the upload endpoint."""
+    logging.info("Uploading image: %s", path)
+
+    with open(path, "rb") as f:
+        response = requests.post(
+            UPLOAD_URL,
+            data={
+                "apiKey": api_key,
+                "fileType": "image",
+            },
+            files={
+                "file": (os.path.basename(path), f, mime)
+            },
+            timeout=120,
+        )
+
+    response.raise_for_status()
+    result = response.json()
+
+    file_name = result.get("data", {}).get("fileName")
+    if not file_name:
+        raise RuntimeError(f"Upload succeeded but no data.fileName found: {result}")
+
+    return file_name
+
+# receives image link or image file and sends to upload_file; 
+# determines mime type for the upload_file function
+def upload_image(path: str) -> str:
+    api_key = require_api_key()
+
+    # Handle URLs — download to a temp file first
+    if path.startswith("http://") or path.startswith("https://"):
+        response = requests.get(path, timeout=30)
+        response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type", "")
+        if "png" in content_type:
+            ext = ".png"
+            mime = "image/png"
+        else:
+            ext = ".jpg"
+            mime = "image/jpeg"
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
+
+        try:
+            return upload_file(tmp_path, mime, api_key)
+        finally:
+            os.remove(tmp_path)
+
+    # Handle local file paths
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".png":
+        mime = "image/png"
+    elif ext in [".jpg", ".jpeg"]:
+        mime = "image/jpeg"
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    return upload_file(path, mime, api_key)
+
+# safety function; makes sure an image is actually acceptable by runninghub and it isn't 
+# a local file (if it is, runs it through upload image)
+def resolve_image_value(image_input: Optional[str], default_value: str) -> str:
+    if not image_input:
+        return default_value
+
+    # If it looks like a local file path, upload it.
+    if os.path.exists(image_input):
+        return upload_image(image_input)
+
+    # Otherwise assume it is already a RunningHub file token.
+    return image_input
+
+# submits images to runninghub, along with payload, and starts the generation process
+def submit_image_job() -> dict[str, Any]:
+    api_key = require_api_key()
+
+    # passes the current outfit and girl image, and if those don't work use default
+    outfit_value = resolve_image_value(outfitImage, DEFAULT_OUTFIT)
+    girl_value = resolve_image_value(girlImage, DEFAULT_GIRL)
+
+    logging.info("Submitting RunningHub job")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    payload = {
+        "addMetadata": True,
+        "nodeInfoList": [
+            {
+                "nodeId": "78",
+                "fieldName": "image",
+                "fieldValue": girl_value,
+                "description": "",
+            },
+            {
+                "nodeId": "150",
+                "fieldName": "prompt",
+                "fieldValue": prompt,
+                "description": "",
+            },
+            {
+                "nodeId": "169",
+                "fieldName": "image",
+                "fieldValue": outfit_value,
+                "description": "",
+            },
+        ],
+        "instanceType": "default",
+        "usePersonalQueue": False,
+    }
+
+    response = requests.post(
+        RUN_URL,
+        headers=headers,
+        json=payload,
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    result = response.json()
+    task_id = result.get("taskId") or result.get("data", {}).get("taskId")
+    if not task_id:
+        raise RuntimeError(f"No task ID in response: {result}")
+    
+    global current_task_id
+    current_task_id = task_id
+
+    return {
+        "task_id": task_id,
+        "submitted_response": result,
+    }
+
+#@mcp.tool(name="set_outfit_image", description="takes in a str for the image path/link, and sets that image as the new outfit.")
+def set_outfit_image(image_path: str) -> dict[str, Any]:
+    """
+    Upload an outfit image and store it as the default outfit image
+    for future generate_image calls.
+
+    image_path can be:
+    - A local file path
+    - A URL 
+    """
+
+    global outfitImage # referencing global variable outfitIMage
+
+    if not image_path:
+        raise ValueError("image_path is required.")
+
+    if not image_path.startswith("http://") and not image_path.startswith("https://"):
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+    uploaded_value = upload_image(image_path)
+    outfitImage = uploaded_value
+
+    return {
+        "ok": True,
+        "message": "New outfit image has been set. Now when generate_image is called, it will use this outfit.",
+        "image_path": image_path,
+        "stored_outfit_image": uploaded_value,
+    }
+
+@mcp.tool(name="reset_to_defaults", description="resets all image and prompt values to the default ones.")
+def reset_to_defaults() -> dict[str, Any]:
+    global girlImage, outfitImage, prompt
+
+    girlImage = DEFAULT_GIRL
+    outfitImage = DEFAULT_OUTFIT
+    prompt = DEFAULT_PROMPT
+
+    return {
+        "ok": True,
+        "message": "All settings reset to defaults.",
+        "girl_image": girlImage,
+        "outfit_image": outfitImage,
+        "prompt": prompt,
+    }
+
+#@mcp.tool(name="set_girl_image", description="accepts a str for the image's path/link and sets it as the new outfit image")
+def set_girl_image(image_path: str) -> dict[str, Any]:
+    """
+    Upload a girl/model image and store it as the default girl image
+    for future generate_image calls.
+
+    image_path can be:
+    - A local file path
+    - A url
+    """
+    global girlImage
+
+    if not image_path:
+        raise ValueError("image_path is required.")
+
+    if not image_path.startswith("http://") and not image_path.startswith("https://"):
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+    uploaded_value = upload_image(image_path)
+    girlImage = uploaded_value
+
+    return {
+        "ok": True,
+        "message": "New girl image has been set. Now when generate_image is called, it will use this image.",
+        "image_path": image_path,
+        "stored_girl_image": uploaded_value,
+    }
+
+
+#@mcp.tool(name="set_prompt", description="accepts a str for the new prompt and changes the current prompt to the accepted string")
+def set_prompt(new_prompt: str) -> dict[str, Any]:
+    global prompt
+
+    if not new_prompt:
+        raise ValueError("new_prompt is required.")
+
+    prompt = new_prompt
+
+    return {
+        "ok": True,
+        "message": "Prompt updated successfully.",
+        "prompt": prompt,
+    }
+
+# helper function; checks current progress of the task based on task id
+def query_task(task_id: Optional[str] = current_task_id) -> dict[str, Any]:
+    api_key = require_api_key()
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    response = requests.post(
+        QUERY_URL,
+        headers=headers,
+        json={"taskId": task_id},
+        timeout=120,
+    )
+    response.raise_for_status()
+
+    result = response.json()
+    status = result.get("status", "UNKNOWN")
+
+    output_urls: list[str] = []
+    for item in result.get("results", []) or []:
+        url = item.get("url")
+        if url:
+            output_urls.append(url)
+
+    return {
+        "task_id": task_id,
+        "status": status,
+        "error_message": result.get("errorMessage"),
+        "results": result.get("results"),
+        "output_urls": output_urls,
+        "raw": result,
+    }
+
+
+@mcp.tool(name="generate_image", description="Generate an image. the prompt, girlFile, and outfitFile are optional strings.")
+def generate_image(prompt:Optional[str]=DEFAULT_PROMPT, girlFile:Optional[str]=DEFAULT_GIRL, outfitFile:Optional[str]=DEFAULT_OUTFIT) -> dict[str, Any]:
+    
+    if prompt != DEFAULT_PROMPT:
+        set_prompt(prompt)
+    
+    if girlFile != DEFAULT_GIRL:
+        set_girl_image(girlFile)
+
+    if outfitFile != DEFAULT_OUTFIT:
+        set_outfit_image(outfitFile)
+    
+    job = submit_image_job()
+
+    return {
+        "ok": True,
+        "message": "Task submitted successfully.",
+        "task_id": job["task_id"],
+        "next_step": "Call get_image_result with this task_id.",
+    }
+
+
+@mcp.tool(name="get_image_result", description="checks the current progress of the image generation, and returns the image url if it is done.")
+def get_image_result() -> dict[str, Any]:
+    result = query_task(current_task_id)
+
+    if result["status"] == "SUCCESS":
+        return {
+            "ok": True,
+            "status": result["status"],
+            "task_id": current_task_id,
+            "image_urls": result["output_urls"],
+            "message": "Task completed successfully.",
+        }
+
+    if result["status"] in {"QUEUED", "RUNNING"}:
+        return {
+            "ok": True,
+            "status": result["status"],
+            "task_id": current_task_id,
+            "message": "Task is not complete yet. Call get_image_result again later.",
+        }
+
+    return {
+        "ok": False,
+        "status": result["status"],
+        "task_id": current_task_id,
+        "error_message": result.get("error_message") or "Task failed or returned an unknown status.",
+    }
+
+
+if __name__ == "__main__":
+    mcp.run(transport="sse")

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Studio · Image Generator</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+    <div id="shell">
+        <header>
+            <div class="wordmark">
+                RunningHub
+                <span>image generation</span>
+            </div>
+            <div class="header-right">
+                <div class="status-pill">
+                    <span class="dot"></span>
+                    <span id="status-label">connected</span>
+                </div>
+                <a href="settings.html" id="settings-btn" title="Settings">&#9881;</a>
+                <button id="clear-btn">clear</button>
+            </div>
+        </header>
+
+        <div id="messages"></div>
+
+        <div id="input-row">
+            <textarea id="user-input" rows="1"
+                placeholder="Describe an image, paste a URL, or ask to check progress…"></textarea>
+            <button id="send-btn" title="Send (Enter)">&#9654;</button>
+        </div>
+        <p class="hint">Enter to send · Shift+Enter for newline · Images appear inline when ready</p>
+
+    </div>
+    <script src="script.js"></script>
+</body>
+
+</html>
