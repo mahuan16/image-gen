@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 from typing import Any, Optional
+from dotenv import load_dotenv
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -20,7 +21,8 @@ mcp = FastMCP(
     ),
 )
 
-API_KEY = "42d70f506b0d42db939ec7a6fa1ff1a8"
+load_dotenv()  
+API_KEY = os.getenv("API_KEY")
 UPLOAD_URL = "https://www.runninghub.ai/task/openapi/upload"
 RUN_URL = "https://www.runninghub.ai/openapi/v2/run/ai-app/2034097696507699202"
 QUERY_URL = "https://www.runninghub.ai/openapi/v2/query"
